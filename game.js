@@ -1,7 +1,7 @@
 // ============================================================
 //  UNO TRUTH OR DARE — game.js
 //  Full UNO Engine + 8 Custom Truths/Dares + Multi-Card Combo +
-//  High-Reliability Online Multiplayer (WebRTC PeerJS + BroadcastChannel)
+//  Ultra-Reliable Real-Time Mobile Networking (WebRTC + BroadcastChannel)
 // ============================================================
 
 'use strict';
@@ -159,7 +159,7 @@ let state = {
   currentColor: 'red',
   phase: 'play',
   numPlayers: 2,
-  gameMode: 'ai', // 'ai' | 'pass' | 'online'
+  gameMode: 'online',
   gameOver: false,
   pendingTod: null
 };
@@ -173,21 +173,35 @@ let pendingMultiWildCards = null;
 let localPlayerName = "Pemain 1";
 let localPlayerAvatar = "🧑";
 
-// ─── MULTIPLAYER NETWORKING STATE (WebRTC + BroadcastChannel) ──
+// ─── HIGH-STABILITY NETWORKING CONFIG (Google STUN + WebRTC) ──
+const PEER_CONFIG = {
+  debug: 1,
+  config: {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      { urls: 'stun:stun4.l.google.com:19302' }
+    ]
+  }
+};
+
 const PEER_PREFIX = 'unotod-';
 let mpState = {
   peer: null,
-  channel: null, // BroadcastChannel fallback
+  channel: null,
   isOnline: false,
   isHost: false,
   roomCode: '',
   myPeerId: '',
   myPlayerIndex: 0,
-  connections: [], // DataConnections
+  connections: [],
   hostConnection: null,
   lobbyPlayers: [],
   maxPlayers: 2,
-  localClientId: 'client_' + Math.random().toString(36).substring(2, 9)
+  localClientId: 'cl_' + Math.random().toString(36).substring(2, 9),
+  joinRetryTimer: null
 };
 
 // ─── DECK BUILDER ─────────────────────────────────────────
@@ -230,7 +244,7 @@ function shuffle(arr) {
 }
 
 // ─── INIT GAME ────────────────────────────────────────────
-function initState(numPlayers, gameMode = 'ai', onlinePlayers = null) {
+function initState(numPlayers, gameMode = 'online', onlinePlayers = null) {
   const deck = buildDeck();
   shuffle(deck);
 
@@ -1295,7 +1309,7 @@ function triggerLiveReaction(emoji, fromOnline = false) {
   }
 }
 
-// ─── HIGH-RELIABILITY MULTIPLAYER NETWORKING (WebRTC + BroadcastChannel) ──
+// ─── HIGH-RELIABILITY MULTIPLAYER NETWORKING ──────────────
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
@@ -1307,7 +1321,7 @@ function generateRoomCode() {
 
 function initHostRoom(maxPlayers = 2) {
   const roomCode = generateRoomCode();
-  const peerId = PEER_PREFIX + roomCode.replace('UNO-', '');
+  const peerId = (PEER_PREFIX + roomCode.replace('UNO-', '')).toLowerCase();
 
   mpState.isOnline = true;
   mpState.isHost = true;
@@ -1321,15 +1335,14 @@ function initHostRoom(maxPlayers = 2) {
     { peerId: peerId, clientId: mpState.localClientId, name: localPlayerName, avatar: localPlayerAvatar, isHost: true }
   ];
 
-  // Buka modal lobi SECARA INSTAN tanpa menunggu handshake cloud
   openOnlineLobby(roomCode);
   document.getElementById('lobby-connection-status').innerHTML =
-    `<span class="status-dot online"></span> Ruangan Siap! Bagikan kode ke teman.`;
+    `<span class="status-dot online"></span> Ruangan Siap! Bagikan ke HP temanmu.`;
 
   // Init BroadcastChannel untuk sinkronisasi lokal antar-tab
   try {
     if (mpState.channel) mpState.channel.close();
-    mpState.channel = new BroadcastChannel('unotod_room_' + roomCode);
+    mpState.channel = new BroadcastChannel('unotod_room_' + roomCode.toUpperCase());
     mpState.channel.onmessage = (event) => {
       handleHostChannelMessage(event.data);
     };
@@ -1337,15 +1350,15 @@ function initHostRoom(maxPlayers = 2) {
     console.log('BroadcastChannel not available:', e);
   }
 
-  // Init PeerJS WebRTC jika library tersedia
+  // Init PeerJS WebRTC dengan STUN Google untuk mabar 4G/5G/Wi-Fi antar HP
   if (typeof Peer !== 'undefined') {
     try {
       if (mpState.peer) mpState.peer.destroy();
-      mpState.peer = new Peer(peerId, { debug: 1 });
+      mpState.peer = new Peer(peerId, PEER_CONFIG);
 
       mpState.peer.on('open', (id) => {
         document.getElementById('lobby-connection-status').innerHTML =
-          `<span class="status-dot online"></span> Ruangan Online Siap! Bagikan kode.`;
+          `<span class="status-dot online"></span> Ruangan Online Siap! Bagikan ke HP teman.`;
       });
 
       mpState.peer.on('connection', (conn) => {
@@ -1363,29 +1376,42 @@ function initHostRoom(maxPlayers = 2) {
     }
   }
 
-  showToast(`🌐 Ruangan ${roomCode} berhasil dibuat!`, 'success');
+  showToast(`📱 Ruangan ${roomCode} siap untuk mabar!`, 'success');
 }
 
 function handleIncomingPeerConnection(conn) {
   if (mpState.lobbyPlayers.length >= mpState.maxPlayers) {
-    conn.on('open', () => {
-      conn.send({ type: 'ROOM_FULL', message: 'Ruangan sudah penuh!' });
+    const reject = () => {
+      try { conn.send({ type: 'ROOM_FULL', message: 'Ruangan sudah penuh!' }); } catch (e) {}
       setTimeout(() => conn.close(), 500);
-    });
+    };
+    if (conn.open) reject();
+    else conn.on('open', reject);
     return;
   }
 
-  conn.on('open', () => {
-    mpState.connections.push(conn);
+  const registerConn = () => {
+    if (!mpState.connections.some(c => c.peer === conn.peer)) {
+      mpState.connections.push(conn);
+    }
+    // Kirim lobby state langsung saat koneksi tersambung
+    mpBroadcastLobbyState();
+  };
 
-    conn.on('data', (data) => {
-      handleHostReceivedData(conn, data);
-    });
-
-    conn.on('close', () => {
-      handlePeerDisconnected(conn);
-    });
+  // Pasang listener data secara langsung
+  conn.on('data', (data) => {
+    handleHostReceivedData(conn, data);
   });
+
+  conn.on('close', () => {
+    handlePeerDisconnected(conn);
+  });
+
+  if (conn.open) {
+    registerConn();
+  } else {
+    conn.on('open', registerConn);
+  }
 }
 
 function handleHostReceivedData(conn, data) {
@@ -1398,9 +1424,18 @@ function handleHostChannelMessage(data) {
 }
 
 function processIncomingHostAction(senderId, data) {
+  if (!data) return;
+
   if (data.type === 'JOIN_REQUEST') {
-    const exists = mpState.lobbyPlayers.find(p => p.peerId === senderId || p.clientId === data.clientId);
-    if (!exists && mpState.lobbyPlayers.length < mpState.maxPlayers) {
+    const existingIdx = mpState.lobbyPlayers.findIndex(p => 
+      (senderId && p.peerId === senderId) || (data.clientId && p.clientId === data.clientId)
+    );
+
+    if (existingIdx !== -1) {
+      // Update data jika sudah ada
+      mpState.lobbyPlayers[existingIdx].name = data.name || mpState.lobbyPlayers[existingIdx].name;
+      mpState.lobbyPlayers[existingIdx].avatar = data.avatar || mpState.lobbyPlayers[existingIdx].avatar;
+    } else if (mpState.lobbyPlayers.length < mpState.maxPlayers) {
       const newPlayer = {
         peerId: senderId,
         clientId: data.clientId,
@@ -1410,8 +1445,10 @@ function processIncomingHostAction(senderId, data) {
       };
       mpState.lobbyPlayers.push(newPlayer);
       addLobbyChatMessage('system', `👋 ${newPlayer.name} bergabung ke lobi!`);
-      mpBroadcastLobbyState();
     }
+
+    // Selalu kirim balik LOBBY_UPDATE agar guest langsung tersinkron
+    mpBroadcastLobbyState();
   } else if (data.type === 'ACTION_PLAY_CARD') {
     const pIdx = mpState.lobbyPlayers.findIndex(p => p.peerId === senderId || p.clientId === senderId);
     if (pIdx === state.currentPlayer) {
@@ -1463,12 +1500,12 @@ function handlePeerDisconnected(conn) {
 }
 
 function mpBroadcast(payload) {
-  // Broadcast via PeerJS WebRTC
   mpState.connections.forEach(conn => {
-    if (conn.open) conn.send(payload);
+    if (conn.open) {
+      try { conn.send(payload); } catch (e) {}
+    }
   });
 
-  // Broadcast via BroadcastChannel
   if (mpState.channel) {
     try {
       mpState.channel.postMessage({
@@ -1483,14 +1520,16 @@ function mpBroadcastLobbyState() {
   mpState.connections.forEach((conn, index) => {
     const playerIndex = index + 1;
     if (conn.open) {
-      conn.send({
-        type: 'LOBBY_UPDATE',
-        players: mpState.lobbyPlayers,
-        playerIndex: playerIndex,
-        maxPlayers: mpState.maxPlayers,
-        customTruths: customTruths,
-        customDares: customDares
-      });
+      try {
+        conn.send({
+          type: 'LOBBY_UPDATE',
+          players: mpState.lobbyPlayers,
+          playerIndex: playerIndex,
+          maxPlayers: mpState.maxPlayers,
+          customTruths: customTruths,
+          customDares: customDares
+        });
+      } catch (e) {}
     }
   });
 
@@ -1513,25 +1552,33 @@ function mpBroadcastLobbyState() {
 function joinOnlineRoom(roomCodeInput) {
   const cleanCode = roomCodeInput.trim().toUpperCase();
   const roomCode = cleanCode.startsWith('UNO-') ? cleanCode : `UNO-${cleanCode}`;
-  const hostPeerId = PEER_PREFIX + roomCode.replace('UNO-', '');
+  const hostPeerId = (PEER_PREFIX + roomCode.replace('UNO-', '')).toLowerCase();
+
+  clearInterval(mpState.joinRetryTimer);
 
   mpState.isOnline = true;
   mpState.isHost = false;
   mpState.roomCode = roomCode;
 
+  // Inisialisasi tampilan awal agar Guest langsung melihat dirinya di lobi
+  mpState.lobbyPlayers = [
+    { peerId: hostPeerId, clientId: 'host', name: 'Host Ruangan', avatar: '👑', isHost: true },
+    { peerId: 'me', clientId: mpState.localClientId, name: localPlayerName, avatar: localPlayerAvatar, isHost: false }
+  ];
+  mpState.myPlayerIndex = 1;
+
   openOnlineLobby(roomCode);
   document.getElementById('lobby-connection-status').innerHTML =
-    `<span class="status-dot online"></span> Menghubungkan ke Ruangan ${roomCode}...`;
+    `<span class="status-dot online"></span> Menghubungkan ke HP Host (${roomCode})...`;
 
-  // Init BroadcastChannel untuk koneksi lokal/tab
+  // 1. Koneksi BroadcastChannel lokal
   try {
     if (mpState.channel) mpState.channel.close();
-    mpState.channel = new BroadcastChannel('unotod_room_' + roomCode);
+    mpState.channel = new BroadcastChannel('unotod_room_' + roomCode.toUpperCase());
     mpState.channel.onmessage = (event) => {
       handleClientReceivedData(event.data);
     };
 
-    // Kirim request join via channel
     mpState.channel.postMessage({
       type: 'JOIN_REQUEST',
       clientId: mpState.localClientId,
@@ -1541,27 +1588,29 @@ function joinOnlineRoom(roomCodeInput) {
     });
   } catch (e) {}
 
-  // Init PeerJS WebRTC
+  // 2. Koneksi WebRTC PeerJS
   if (typeof Peer !== 'undefined') {
     try {
       if (mpState.peer) mpState.peer.destroy();
-      mpState.peer = new Peer({ debug: 1 });
+      mpState.peer = new Peer(PEER_CONFIG);
 
       mpState.peer.on('open', (myId) => {
         mpState.myPeerId = myId;
         const conn = mpState.peer.connect(hostPeerId, { reliable: true });
         mpState.hostConnection = conn;
 
-        conn.on('open', () => {
-          conn.send({
-            type: 'JOIN_REQUEST',
-            clientId: mpState.localClientId,
-            name: localPlayerName,
-            avatar: localPlayerAvatar
-          });
-          document.getElementById('lobby-connection-status').innerHTML =
-            `<span class="status-dot online"></span> ✅ Terhubung ke Lobi Ruangan!`;
-        });
+        const sendJoin = () => {
+          try {
+            conn.send({
+              type: 'JOIN_REQUEST',
+              clientId: mpState.localClientId,
+              name: localPlayerName,
+              avatar: localPlayerAvatar
+            });
+            document.getElementById('lobby-connection-status').innerHTML =
+              `<span class="status-dot online"></span> ✅ Terhubung ke Lobi Host!`;
+          } catch (e) {}
+        };
 
         conn.on('data', (data) => {
           handleClientReceivedData(data);
@@ -1570,6 +1619,19 @@ function joinOnlineRoom(roomCodeInput) {
         conn.on('close', () => {
           showToast('🚪 Terputus dari Ruangan Host', 'warning');
         });
+
+        if (conn.open) {
+          sendJoin();
+        } else {
+          conn.on('open', sendJoin);
+        }
+
+        // Retry handshake periodically in case of mobile network packet delays
+        mpState.joinRetryTimer = setInterval(() => {
+          if (conn.open) {
+            sendJoin();
+          }
+        }, 1500);
       });
 
       mpState.peer.on('error', (err) => {
@@ -1587,6 +1649,7 @@ function handleClientReceivedData(data) {
   if (!data || data.senderClientId === mpState.localClientId) return;
 
   if (data.type === 'LOBBY_UPDATE') {
+    clearInterval(mpState.joinRetryTimer);
     mpState.lobbyPlayers = data.players;
     const myIndexInList = data.players.findIndex(p => p.clientId === mpState.localClientId);
     if (myIndexInList !== -1) {
@@ -1597,14 +1660,18 @@ function handleClientReceivedData(data) {
     mpState.maxPlayers = data.maxPlayers || 2;
     if (data.customTruths) customTruths = data.customTruths;
     if (data.customDares)  customDares  = data.customDares;
+
+    document.getElementById('lobby-connection-status').innerHTML =
+      `<span class="status-dot online"></span> ✅ Terhubung ke Lobi Host!`;
+
     renderLobbyUI();
   } else if (data.type === 'GAME_START') {
+    clearInterval(mpState.joinRetryTimer);
     document.getElementById('online-lobby-modal').classList.remove('open');
     document.getElementById('start-screen').style.display = 'none';
     state = data.state;
     state.gameMode = 'online';
 
-    // Sesuaikan myPlayerIndex berdasarkan list players
     const myIndexInList = state.players.findIndex(p => p.clientId === mpState.localClientId);
     if (myIndexInList !== -1) {
       mpState.myPlayerIndex = myIndexInList;
@@ -1612,7 +1679,7 @@ function handleClientReceivedData(data) {
 
     document.getElementById('online-room-badge').style.display = 'flex';
     document.getElementById('header-room-code').textContent = mpState.roomCode;
-    document.getElementById('header-mode-tag').textContent = 'Online Multiplayer';
+    document.getElementById('header-mode-tag').textContent = 'Mabar Beda HP';
 
     renderAll();
     showToast('🎮 Game Dimulai!', 'success');
@@ -1641,7 +1708,7 @@ function sendActionToHost(actionPayload) {
   actionPayload.senderClientId = mpState.localClientId;
 
   if (mpState.hostConnection && mpState.hostConnection.open) {
-    mpState.hostConnection.send(actionPayload);
+    try { mpState.hostConnection.send(actionPayload); } catch (e) {}
   }
 
   if (mpState.channel) {
@@ -1660,7 +1727,27 @@ function syncOnlineGameState() {
   }
 }
 
-// ─── LOBBY UI CONTROLLER ──────────────────────────────────
+// ─── LOBBY UI & QR CODE CONTROLLER ────────────────────────
+function renderLobbyQRCode(roomCode) {
+  const qrContainer = document.getElementById('qrcode-box');
+  if (!qrContainer || typeof QRCode === 'undefined') return;
+  qrContainer.innerHTML = '';
+  
+  let targetUrl = window.location.href.split('#')[0] + '#room=' + encodeURIComponent(roomCode);
+  if (targetUrl.startsWith('file:///')) {
+    targetUrl = roomCode;
+  }
+
+  new QRCode(qrContainer, {
+    text: targetUrl,
+    width: 140,
+    height: 140,
+    colorDark : "#07071a",
+    colorLight : "#ffffff",
+    correctLevel : QRCode.CorrectLevel.M
+  });
+}
+
 function openOnlineLobby(roomCode) {
   document.getElementById('lobby-room-code-text').textContent = roomCode;
   document.getElementById('online-lobby-modal').classList.add('open');
@@ -1680,6 +1767,7 @@ function openOnlineLobby(roomCode) {
 }
 
 function closeOnlineLobby() {
+  clearInterval(mpState.joinRetryTimer);
   document.getElementById('online-lobby-modal').classList.remove('open');
   if (mpState.peer) {
     mpState.peer.destroy();
@@ -1723,7 +1811,7 @@ function renderLobbyUI() {
       slotEl.innerHTML = `
         <span class="slot-avatar">⏳</span>
         <div class="slot-info">
-          <span class="slot-name" style="color:rgba(255,255,255,0.4)">Menunggu teman...</span>
+          <span class="slot-name" style="color:rgba(255,255,255,0.4)">Menunggu HP teman...</span>
         </div>
       `;
     }
@@ -1779,7 +1867,7 @@ function startOnlineGameHost() {
 
   document.getElementById('online-room-badge').style.display = 'flex';
   document.getElementById('header-room-code').textContent = mpState.roomCode;
-  document.getElementById('header-mode-tag').textContent = 'Online Multiplayer';
+  document.getElementById('header-mode-tag').textContent = 'Mabar Beda HP';
 
   renderAll();
 
@@ -1788,7 +1876,7 @@ function startOnlineGameHost() {
     state: state
   });
 
-  showToast(`🎮 Permainan Online Dimulai! Host: ${localPlayerName}`, 'success');
+  showToast(`🎮 Permainan Mabar Dimulai! Host: ${localPlayerName}`, 'success');
   scheduleNextAI();
 }
 
@@ -1937,7 +2025,7 @@ function createStars() {
 // ─── SETUP START SCREEN & EVENTS ──────────────────────────
 let selectedPlayerCount = 2;
 let selectedOnlineCapacity = 2;
-let selectedGameMode = 'ai';
+let selectedGameMode = 'online';
 
 function setupStartScreen() {
   // Offline Count Buttons
@@ -2048,16 +2136,28 @@ function setupStartScreen() {
     joinOnlineRoom(code);
   });
 
-  // Copy Code & Link
+  // Copy Code
   document.getElementById('btn-copy-room-code').addEventListener('click', () => {
     navigator.clipboard.writeText(mpState.roomCode);
     showToast(`📋 Kode ${mpState.roomCode} berhasil disalin!`, 'success');
   });
 
-  document.getElementById('btn-copy-room-link').addEventListener('click', () => {
-    const shareText = `Ayo main UNO Truth or Dare bersamaku! Kode Ruangan: ${mpState.roomCode}`;
-    navigator.clipboard.writeText(shareText);
-    showToast(`🔗 Kode & pesan undangan berhasil disalin!`, 'success');
+  // Share to WhatsApp
+  document.getElementById('btn-share-wa').addEventListener('click', () => {
+    let url = window.location.href.split('#')[0] + '#room=' + encodeURIComponent(mpState.roomCode);
+    const msg = `🎮 Ayo mabar UNO Truth or Dare bersamaku!\n\n🔑 Kode Ruangan: *${mpState.roomCode}*\n🔗 Link: ${url}`;
+    const waUrl = `https://api.whatsapp.com/send?text=${encodeURIComponent(msg)}`;
+    window.open(waUrl, '_blank');
+  });
+
+  // Toggle QR Code
+  document.getElementById('btn-toggle-qr').addEventListener('click', () => {
+    const qrWrap = document.getElementById('lobby-qr-container');
+    const isHidden = (qrWrap.style.display === 'none' || !qrWrap.style.display);
+    qrWrap.style.display = isHidden ? 'flex' : 'none';
+    if (isHidden) {
+      renderLobbyQRCode(mpState.roomCode);
+    }
   });
 
   // Lobby actions
