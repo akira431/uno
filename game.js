@@ -479,7 +479,9 @@ function playCard(playerIndex, cardId, chosenColor = null) {
   player.hand.splice(idx, 1);
   state.discard.push(card);
 
-  // 🎭 Special Truth or Dare Card
+  // 🎭 Kartu Khusus Truth or Dare — SATU-SATUNYA kartu yang memicu tantangan.
+  // Pemain SETELAH pemilik kartu ini yang wajib memilih Truth atau Dare,
+  // sementara warna berikutnya bebas dipilih oleh PEMILIK kartu.
   if (card.value === 'wild_tod') {
     state.currentColor = chosenColor || 'red';
     const victim = state.players[nextPlayerIndex(1)];
@@ -493,26 +495,16 @@ function playCard(playerIndex, cardId, chosenColor = null) {
     return true;
   }
 
-  // Wild & Wild +4
+  // Wild & Wild +4 — TIDAK ada Truth or Dare lagi, cuma efek kartu UNO biasa.
+  // Wild +4: korban langsung dapat 4 kartu tambahan, warna bebas pilih pemilik kartu.
   if (card.type === 'wild') {
     state.currentColor = chosenColor || 'red';
     if (card.value === 'wild4') {
       const victim = state.players[nextPlayerIndex(1)];
-      showToast(`🔥 ${player.name} memainkan Wild +4 ke ${victim.name}!`);
-      
-      triggerTruthOrDare(victim, `Kena kartu Wild +4 dari ${player.name}! Selesaikan tantangan atau ambil 4 kartu!`, (completed) => {
-        if (!completed) {
-          const drawn = drawFromDeck(4);
-          victim.hand.push(...drawn);
-          showToast(`${victim.name} mengambil 4 kartu penalti!`);
-        } else {
-          showToast(`✨ ${victim.name} berhasil menyelesaikan tantangan!`);
-        }
-        advanceTurn(2);
-        checkPostPlay(player);
-      });
-      syncOnlineGameState();
-      return true;
+      const drawn = drawFromDeck(4);
+      victim.hand.push(...drawn);
+      showToast(`🔥 ${player.name} memainkan Wild +4 ke ${victim.name}! ${victim.name} mengambil 4 kartu.`);
+      advanceTurn(2);
     } else {
       advanceTurn(1);
     }
@@ -531,22 +523,12 @@ function playCard(playerIndex, cardId, chosenColor = null) {
         advanceTurn(1);
       }
     } else if (card.value === 'draw2') {
+      // Draw +2 — TIDAK ada Truth or Dare lagi, korban langsung dapat 2 kartu tambahan.
       const victim = state.players[nextPlayerIndex(1)];
-      showToast(`⚡ ${player.name} memainkan Draw +2 ke ${victim.name}!`);
-      
-      triggerTruthOrDare(victim, `Kena kartu Draw +2 dari ${player.name}! Jawab/Lakukan atau ambil 2 kartu!`, (completed) => {
-        if (!completed) {
-          const drawn = drawFromDeck(2);
-          victim.hand.push(...drawn);
-          showToast(`${victim.name} mengambil 2 kartu penalti!`);
-        } else {
-          showToast(`✨ ${victim.name} sukses menyelesaikan tantangan!`);
-        }
-        advanceTurn(2);
-        checkPostPlay(player);
-      });
-      syncOnlineGameState();
-      return true;
+      const drawn = drawFromDeck(2);
+      victim.hand.push(...drawn);
+      showToast(`⚡ ${player.name} memainkan Draw +2 ke ${victim.name}! ${victim.name} mengambil 2 kartu.`);
+      advanceTurn(2);
     }
   } else {
     state.currentColor = card.color;
@@ -624,38 +606,18 @@ function playMultipleCards(playerIndex, cardIds, chosenColor = null) {
     state.currentColor = chosenColor || 'red';
     const totalDraw = count * 4;
     const victim = state.players[nextPlayerIndex(1)];
-    
-    triggerTruthOrDare(victim, `Kena Combo Wild +${totalDraw} (${count}x Wild +4) dari ${player.name}! Selesaikan tantangan atau ambil ${totalDraw} kartu!`, (completed) => {
-      if (!completed) {
-        const drawn = drawFromDeck(totalDraw);
-        victim.hand.push(...drawn);
-        showToast(`${victim.name} mengambil ${totalDraw} kartu penalti!`);
-      } else {
-        showToast(`✨ ${victim.name} berhasil lolos dari ${totalDraw} kartu penalti!`);
-      }
-      advanceTurn(2);
-      checkPostPlay(player);
-    });
-    syncOnlineGameState();
-    return true;
+    const drawn = drawFromDeck(totalDraw);
+    victim.hand.push(...drawn);
+    showToast(`${victim.name} mengambil ${totalDraw} kartu dari Combo Wild +4!`);
+    advanceTurn(2);
   } else if (firstValue === 'draw2') {
     state.currentColor = lastCard.color;
     const totalDraw = count * 2;
     const victim = state.players[nextPlayerIndex(1)];
-
-    triggerTruthOrDare(victim, `Kena Combo Draw +${totalDraw} (${count}x +2) dari ${player.name}! Jawab/Lakukan atau ambil ${totalDraw} kartu!`, (completed) => {
-      if (!completed) {
-        const drawn = drawFromDeck(totalDraw);
-        victim.hand.push(...drawn);
-        showToast(`${victim.name} mengambil ${totalDraw} kartu penalti!`);
-      } else {
-        showToast(`✨ ${victim.name} sukses menyelesaikan tantangan!`);
-      }
-      advanceTurn(2);
-      checkPostPlay(player);
-    });
-    syncOnlineGameState();
-    return true;
+    const drawn = drawFromDeck(totalDraw);
+    victim.hand.push(...drawn);
+    showToast(`${victim.name} mengambil ${totalDraw} kartu dari Combo Draw +2!`);
+    advanceTurn(2);
   } else if (firstValue === 'skip') {
     state.currentColor = lastCard.color;
     showToast(`🚫 ${count} pemain dilewati sekaligus!`);
