@@ -1134,17 +1134,18 @@ function renderPlayerHand() {
   container.innerHTML = '';
 
   // ─── Efek kartu bertumpuk (fanned hand) ───
-  // Kartu saling menutupi seperti kartu asli di tangan — cuma
-  // menyisakan sedikit bagian kiri (berisi simbol pojok) yang
-  // kelihatan. Overlap otomatis mengetat kalau kartunya banyak,
-  // supaya tetap muat tanpa perlu di-scroll ke samping.
+  // BUKAN giliranmu: kartu saling menutupi seperti kartu asli di
+  // tangan, cuma menyisakan sedikit bagian kiri (simbol pojok) yang
+  // kelihatan — hemat tempat, konsisten di semua ukuran layar.
+  // GILIRANMU: kartu otomatis dijabarkan normal (tidak menumpuk)
+  // supaya jelas kelihatan semua dan gampang dipilih.
   const n = displayPlayer.hand.length;
   const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 74;
   const containerWidth = container.clientWidth || (cardW * 6);
   const baseSliver = cardW * 0.42; // porsi kartu yang tetap kelihatan secara default
   let sliver = baseSliver;
 
-  if (n > 1) {
+  if (!isMyTurn && n > 1) {
     const neededWidthAtBase = cardW + baseSliver * (n - 1);
     if (neededWidthAtBase > containerWidth) {
       const minSliver = 22; // batas minimal, tetap cukup buat lihat simbol pojok
@@ -1161,7 +1162,9 @@ function renderPlayerHand() {
     el.dataset.cardId = card.id;
     el.style.animationDelay = (i * 0.03) + 's';
     el.classList.add('dealing');
-    if (i > 0) el.style.marginLeft = (sliver - cardW) + 'px';
+    if (!isMyTurn && i > 0) {
+      el.style.marginLeft = (sliver - cardW) + 'px';
+    }
     el.style.zIndex = i + 1;
 
     let sym = card.display || card.value;
