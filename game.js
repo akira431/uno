@@ -1132,6 +1132,26 @@ function renderPlayerHand() {
   }
 
   container.innerHTML = '';
+
+  // ─── Efek kartu bertumpuk (fanned hand) ───
+  // Kartu saling menutupi seperti kartu asli di tangan — cuma
+  // menyisakan sedikit bagian kiri (berisi simbol pojok) yang
+  // kelihatan. Overlap otomatis mengetat kalau kartunya banyak,
+  // supaya tetap muat tanpa perlu di-scroll ke samping.
+  const n = displayPlayer.hand.length;
+  const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 74;
+  const containerWidth = container.clientWidth || (cardW * 6);
+  const baseSliver = cardW * 0.42; // porsi kartu yang tetap kelihatan secara default
+  let sliver = baseSliver;
+
+  if (n > 1) {
+    const neededWidthAtBase = cardW + baseSliver * (n - 1);
+    if (neededWidthAtBase > containerWidth) {
+      const minSliver = 22; // batas minimal, tetap cukup buat lihat simbol pojok
+      sliver = Math.max(minSliver, (containerWidth - cardW) / (n - 1));
+    }
+  }
+
   displayPlayer.hand.forEach((card, i) => {
     const isSelected = selectedComboCards.includes(card.id);
     const playable = isMyTurn && (isPlayable(card) || isComboMode);
@@ -1141,6 +1161,8 @@ function renderPlayerHand() {
     el.dataset.cardId = card.id;
     el.style.animationDelay = (i * 0.03) + 's';
     el.classList.add('dealing');
+    if (i > 0) el.style.marginLeft = (sliver - cardW) + 'px';
+    el.style.zIndex = i + 1;
 
     let sym = card.display || card.value;
     let label = LABEL_MAP[card.value] || '';
@@ -1462,6 +1484,7 @@ function initHostRoom(maxPlayers = 2) {
     try {
       if (mpState.peer) mpState.peer.destroy();
       mpState.peer = new Peer(peerId, PEER_CONFIG);
+      attachPeerResilienceHandlers(mpState.peer);
 
       mpState.peer.on('open', (id) => {
         document.getElementById('lobby-connection-status').innerHTML =
@@ -1484,6 +1507,23 @@ function initHostRoom(maxPlayers = 2) {
   }
 
   showToast(`📱 Ruangan ${roomCode} siap untuk mabar!`, 'success');
+}
+
+// ─── KETAHANAN KONEKSI PEERJS ──────────────────────────────
+// PeerJS bisa terputus dari signaling server (bukan cuma dari
+// sesama pemain) saat jaringan berubah/goyang. Kalau ini terjadi,
+// peer.connect() tidak akan pernah berhasil sampai peer.reconnect()
+// dipanggil dulu. Fungsi ini dipasang ke setiap objek Peer yang dibuat.
+function attachPeerResilienceHandlers(peerObj) {
+  if (!peerObj) return;
+  peerObj.on('disconnected', () => {
+    console.warn('PeerJS terputus dari signaling server, mencoba reconnect...');
+    setTimeout(() => {
+      try {
+        if (peerObj && !peerObj.destroyed) peerObj.reconnect();
+      } catch (e) {}
+    }, 1000);
+  });
 }
 
 // ─── PULIHKAN SESI HOST SETELAH REFRESH / BUKA ULANG TAB ──
@@ -1521,6 +1561,7 @@ function restoreHostRoom(roomCode, saved) {
     try {
       if (mpState.peer) mpState.peer.destroy();
       mpState.peer = new Peer(peerId, PEER_CONFIG);
+      attachPeerResilienceHandlers(mpState.peer);
 
       mpState.peer.on('open', () => {
         showToast(`🔌 Ruangan ${roomCode} berhasil dipulihkan sebagai Host!`, 'success');
@@ -1830,6 +1871,7 @@ function joinOnlineRoom(roomCodeInput) {
     try {
       if (mpState.peer) mpState.peer.destroy();
       mpState.peer = new Peer(PEER_CONFIG);
+      attachPeerResilienceHandlers(mpState.peer);
 
       mpState.peer.on('open', (myId) => {
         mpState.myPeerId = myId;
@@ -1901,6 +1943,13 @@ function handleHostConnectionLost(hostPeerId) {
       clearInterval(mpState.reconnectRetryTimer);
       showToast('⚠️ Gagal menyambung kembali. Coba muat ulang halaman.', 'error');
       return;
+    }
+
+    // Kalau PeerJS sendiri terputus dari signaling server, pulihkan dulu
+    // sebelum mencoba connect ke host — kalau tidak, connect() akan gagal diam-diam.
+    if (mpState.peer.disconnected) {
+      try { mpState.peer.reconnect(); } catch (e) {}
+      return; // coba lagi di tick berikutnya setelah signaling pulih
     }
 
     try {
