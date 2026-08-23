@@ -258,20 +258,28 @@ function clearSession() {
   try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
 }
 
+let persistHostStateTimer = null;
 function persistHostGameState() {
   if (!mpState.isHost || !mpState.roomCode) return;
-  try {
-    // pendingTod berisi fungsi (onResolved) yang tidak bisa disimpan,
-    // jadi sengaja dikosongkan saat disimpan (aman: tantangan yang
-    // sedang berjalan cukup dilewati kalau host reload di tengah popup).
-    const stateForSave = { ...state, pendingTod: null };
-    localStorage.setItem('unotod_hoststate_' + mpState.roomCode, JSON.stringify({
-      state: stateForSave,
-      lobbyPlayers: mpState.lobbyPlayers,
-      maxPlayers: mpState.maxPlayers,
-      gameStarted: mpState.gameStarted
-    }));
-  } catch (e) {}
+  // Di-debounce (ditunda dikit) supaya nulis ke localStorage TIDAK terjadi
+  // synchronous di setiap aksi kecil (main kartu, ambil kartu, dll) — kalau
+  // dipaksa langsung tiap kali, bisa bikin nge-lag terutama di HP lawas.
+  clearTimeout(persistHostStateTimer);
+  const roomCodeAtCall = mpState.roomCode;
+  persistHostStateTimer = setTimeout(() => {
+    try {
+      // pendingTod berisi fungsi (onResolved) yang tidak bisa disimpan,
+      // jadi sengaja dikosongkan saat disimpan (aman: tantangan yang
+      // sedang berjalan cukup dilewati kalau host reload di tengah popup).
+      const stateForSave = { ...state, pendingTod: null };
+      localStorage.setItem('unotod_hoststate_' + roomCodeAtCall, JSON.stringify({
+        state: stateForSave,
+        lobbyPlayers: mpState.lobbyPlayers,
+        maxPlayers: mpState.maxPlayers,
+        gameStarted: mpState.gameStarted
+      }));
+    } catch (e) {}
+  }, 400);
 }
 
 function loadHostGameState(roomCode) {
@@ -1329,11 +1337,17 @@ function handleColorChoice(color) {
 }
 
 // ─── ACTION BUTTON HANDLERS ───────────────────────────────
-function handleDraw() {
-  const myIdx = getActiveClientIndex();
+function handleDraw(forcedIdx) {
+  // forcedIdx dipakai saat fungsi ini dijalankan HOST atas nama pemain lain
+  // (hasil ACTION_DRAW dari HP tamu) — supaya tidak salah nebak "siapa aku"
+  // lewat getActiveClientIndex() yang selalu balikin index pemilik device ini.
+  // Jaga-jaga: kalau dipanggil langsung dari event listener (misal klik
+  // tombol), argumen pertamanya adalah objek Event, bukan angka — abaikan itu.
+  const hasForcedIdx = (typeof forcedIdx === 'number');
+  const myIdx = hasForcedIdx ? forcedIdx : getActiveClientIndex();
   if (state.currentPlayer !== myIdx || state.gameOver) return;
 
-  if (state.gameMode === 'online' && !mpState.isHost) {
+  if (!hasForcedIdx && state.gameMode === 'online' && !mpState.isHost) {
     sendActionToHost({ type: 'ACTION_DRAW' });
     return;
   }
@@ -1343,8 +1357,11 @@ function handleDraw() {
   player.hand.push(...drawn);
   showToast(`${player.name} mengambil 1 kartu`);
 
-  isComboMode = false;
-  selectedComboCards = [];
+  // Reset mode combo cuma untuk device yang benar-benar menekan tombolnya sendiri
+  if (!hasForcedIdx) {
+    isComboMode = false;
+    selectedComboCards = [];
+  }
 
   const newPlayable = drawn.filter(isPlayable);
   renderAll();
@@ -1687,7 +1704,7 @@ function processIncomingHostAction(senderId, data) {
   } else if (data.type === 'ACTION_DRAW') {
     const pIdx = mpState.lobbyPlayers.findIndex(p => p.peerId === senderId || p.clientId === senderId);
     if (pIdx === state.currentPlayer) {
-      handleDraw();
+      handleDraw(pIdx);
     }
   } else if (data.type === 'ACTION_CALL_UNO') {
     const pIdx = mpState.lobbyPlayers.findIndex(p => p.peerId === senderId || p.clientId === senderId);
