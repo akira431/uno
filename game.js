@@ -1597,9 +1597,12 @@ function handleIncomingPeerConnection(conn) {
   }
 
   const registerConn = () => {
-    if (!mpState.connections.some(c => c.peer === conn.peer)) {
-      mpState.connections.push(conn);
-    }
+    // PENTING: ganti (bukan skip) koneksi lama dengan peer ID yang sama.
+    // Kalau cuma di-skip, koneksi baru yang sehat (misal setelah reconnect)
+    // tidak akan pernah dipakai untuk broadcast — host jadi cuma bisa TERIMA
+    // pesan dari device itu, tapi tidak bisa MENGIRIM balik ke sana lagi.
+    mpState.connections = mpState.connections.filter(c => c.peer !== conn.peer);
+    mpState.connections.push(conn);
     // Kirim lobby state langsung saat koneksi tersambung
     mpBroadcastLobbyState();
   };
@@ -1703,7 +1706,8 @@ function processIncomingHostAction(senderId, data) {
     const p = mpState.lobbyPlayers.find(pl => pl.peerId === senderId || pl.clientId === senderId);
     const sender = p ? p.name : 'Tamu';
     addLobbyChatMessage('user', data.text, sender);
-    mpBroadcast({ type: 'CHAT_MSG', sender: sender, text: data.text });
+    // Kecualikan pengirim asli supaya pesannya tidak dobel di layarnya sendiri
+    mpBroadcast({ type: 'CHAT_MSG', sender: sender, text: data.text }, senderId);
   } else if (data.type === 'ACTION_REACTION') {
     triggerLiveReaction(data.emoji, true);
     mpBroadcast({ type: 'LIVE_REACTION', emoji: data.emoji });
@@ -1736,9 +1740,9 @@ function handlePeerDisconnected(conn) {
   }
 }
 
-function mpBroadcast(payload) {
+function mpBroadcast(payload, excludePeerId = null) {
   mpState.connections.forEach(conn => {
-    if (conn.open) {
+    if (conn.open && conn.peer !== excludePeerId) {
       try { conn.send(payload); } catch (e) {}
     }
   });
@@ -1831,7 +1835,9 @@ function joinOnlineRoom(roomCodeInput) {
     });
   } catch (e) {}
 
-  // 2. Koneksi WebRTC PeerJS
+  // 2. Koneksi WebRTC PeerJS — dengan retry otomatis kalau percobaan
+  // pertama gagal (misal Host belum sempat terdaftar di server saat
+  // kode baru saja dibagikan, atau jaringan lambat sesaat).
   if (typeof Peer !== 'undefined') {
     try {
       if (mpState.peer) mpState.peer.destroy();
@@ -1840,42 +1846,7 @@ function joinOnlineRoom(roomCodeInput) {
 
       mpState.peer.on('open', (myId) => {
         mpState.myPeerId = myId;
-        const conn = mpState.peer.connect(hostPeerId, { reliable: true });
-        mpState.hostConnection = conn;
-
-        const sendJoin = () => {
-          try {
-            conn.send({
-              type: 'JOIN_REQUEST',
-              clientId: mpState.localClientId,
-              name: localPlayerName,
-              avatar: localPlayerAvatar
-            });
-            document.getElementById('lobby-connection-status').innerHTML =
-              `<span class="status-dot online"></span> ✅ Terhubung ke Lobi Host!`;
-          } catch (e) {}
-        };
-
-        conn.on('data', (data) => {
-          handleClientReceivedData(data);
-        });
-
-        conn.on('close', () => {
-          handleHostConnectionLost(hostPeerId);
-        });
-
-        if (conn.open) {
-          sendJoin();
-        } else {
-          conn.on('open', sendJoin);
-        }
-
-        // Retry handshake periodically in case of mobile network packet delays
-        mpState.joinRetryTimer = setInterval(() => {
-          if (conn.open) {
-            sendJoin();
-          }
-        }, 1500);
+        attemptConnectToHost(hostPeerId, 1);
       });
 
       mpState.peer.on('error', (err) => {
@@ -1887,6 +1858,77 @@ function joinOnlineRoom(roomCodeInput) {
   }
 
   showToast(`🌐 Menghubungkan ke Ruangan ${roomCode}...`, 'info');
+}
+
+// ─── COBA CONNECT KE HOST DENGAN RETRY OTOMATIS ───────────
+// PeerJS kadang butuh beberapa detik untuk benar-benar siap di sisi
+// Host, atau paket pertama bisa hilang di jaringan mobile. Fungsi ini
+// mencoba beberapa kali dengan jeda, dan kasih pesan jelas ke user
+// kalau semua percobaan gagal — daripada nyangkut diam-diam selamanya.
+function attemptConnectToHost(hostPeerId, attempt) {
+  if (!mpState.isOnline || mpState.isHost) return; // sudah keluar/berubah peran, batalkan
+
+  const maxAttempts = 6;
+  const statusEl = document.getElementById('lobby-connection-status');
+  if (statusEl) {
+    statusEl.innerHTML = `<span class="status-dot online"></span> Menghubungkan ke HP Host... (percobaan ${attempt}/${maxAttempts})`;
+  }
+
+  let settled = false;
+  const conn = mpState.peer.connect(hostPeerId, { reliable: true });
+  mpState.hostConnection = conn;
+
+  const giveUpTimer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    try { conn.close(); } catch (e) {}
+
+    if (attempt < maxAttempts) {
+      setTimeout(() => attemptConnectToHost(hostPeerId, attempt + 1), 1000);
+    } else {
+      if (statusEl) {
+        statusEl.innerHTML = `<span class="status-dot offline"></span> ❌ Gagal menghubungkan ke Host.`;
+      }
+      showToast('❌ Gagal menyambung ke Ruangan. Pastikan kode benar & Host masih membuka lobi, lalu coba lagi.', 'error');
+    }
+  }, 5000);
+
+  const sendJoin = () => {
+    try {
+      conn.send({
+        type: 'JOIN_REQUEST',
+        clientId: mpState.localClientId,
+        name: localPlayerName,
+        avatar: localPlayerAvatar
+      });
+      if (statusEl) {
+        statusEl.innerHTML = `<span class="status-dot online"></span> ✅ Terhubung ke Lobi Host!`;
+      }
+    } catch (e) {}
+  };
+
+  conn.on('open', () => {
+    settled = true;
+    clearTimeout(giveUpTimer);
+    sendJoin();
+
+    clearInterval(mpState.joinRetryTimer);
+    mpState.joinRetryTimer = setInterval(() => {
+      if (conn.open) sendJoin();
+    }, 1500);
+  });
+
+  conn.on('data', (data) => {
+    handleClientReceivedData(data);
+  });
+
+  conn.on('close', () => {
+    handleHostConnectionLost(hostPeerId);
+  });
+
+  conn.on('error', (err) => {
+    console.warn('Connection error saat join:', err);
+  });
 }
 
 // ─── AUTO-RECONNECT KE HOST SAAT KONEKSI TIBA-TIBA PUTUS ──
