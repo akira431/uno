@@ -203,7 +203,13 @@ let mpState = {
   localClientId: getOrCreateClientId(),
   joinRetryTimer: null,
   reconnectRetryTimer: null,
-  gameStarted: false
+  gameStarted: false,
+  // ── Heartbeat / deteksi koneksi mati (lihat startMultiplayerHeartbeat) ──
+  heartbeatTimer: null,
+  watchdogTimer: null,
+  lastSeen: {},      // host: { [peerId]: timestampTerakhirDenger }
+  hostLastSeen: 0,    // guest: timestamp terakhir dengar apa pun dari host
+  connIndicatorState: 'good'
 };
 
 // ─── SESI & RECONNECT (localStorage) ──────────────────────
@@ -258,28 +264,20 @@ function clearSession() {
   try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
 }
 
-let persistHostStateTimer = null;
 function persistHostGameState() {
   if (!mpState.isHost || !mpState.roomCode) return;
-  // Di-debounce (ditunda dikit) supaya nulis ke localStorage TIDAK terjadi
-  // synchronous di setiap aksi kecil (main kartu, ambil kartu, dll) — kalau
-  // dipaksa langsung tiap kali, bisa bikin nge-lag terutama di HP lawas.
-  clearTimeout(persistHostStateTimer);
-  const roomCodeAtCall = mpState.roomCode;
-  persistHostStateTimer = setTimeout(() => {
-    try {
-      // pendingTod berisi fungsi (onResolved) yang tidak bisa disimpan,
-      // jadi sengaja dikosongkan saat disimpan (aman: tantangan yang
-      // sedang berjalan cukup dilewati kalau host reload di tengah popup).
-      const stateForSave = { ...state, pendingTod: null };
-      localStorage.setItem('unotod_hoststate_' + roomCodeAtCall, JSON.stringify({
-        state: stateForSave,
-        lobbyPlayers: mpState.lobbyPlayers,
-        maxPlayers: mpState.maxPlayers,
-        gameStarted: mpState.gameStarted
-      }));
-    } catch (e) {}
-  }, 400);
+  try {
+    // pendingTod berisi fungsi (onResolved) yang tidak bisa disimpan,
+    // jadi sengaja dikosongkan saat disimpan (aman: tantangan yang
+    // sedang berjalan cukup dilewati kalau host reload di tengah popup).
+    const stateForSave = { ...state, pendingTod: null };
+    localStorage.setItem('unotod_hoststate_' + mpState.roomCode, JSON.stringify({
+      state: stateForSave,
+      lobbyPlayers: mpState.lobbyPlayers,
+      maxPlayers: mpState.maxPlayers,
+      gameStarted: mpState.gameStarted
+    }));
+  } catch (e) {}
 }
 
 function loadHostGameState(roomCode) {
@@ -487,9 +485,7 @@ function playCard(playerIndex, cardId, chosenColor = null) {
   player.hand.splice(idx, 1);
   state.discard.push(card);
 
-  // 🎭 Kartu Khusus Truth or Dare — SATU-SATUNYA kartu yang memicu tantangan.
-  // Pemain SETELAH pemilik kartu ini yang wajib memilih Truth atau Dare,
-  // sementara warna berikutnya bebas dipilih oleh PEMILIK kartu.
+  // 🎭 Special Truth or Dare Card
   if (card.value === 'wild_tod') {
     state.currentColor = chosenColor || 'red';
     const victim = state.players[nextPlayerIndex(1)];
@@ -503,16 +499,26 @@ function playCard(playerIndex, cardId, chosenColor = null) {
     return true;
   }
 
-  // Wild & Wild +4 — TIDAK ada Truth or Dare lagi, cuma efek kartu UNO biasa.
-  // Wild +4: korban langsung dapat 4 kartu tambahan, warna bebas pilih pemilik kartu.
+  // Wild & Wild +4
   if (card.type === 'wild') {
     state.currentColor = chosenColor || 'red';
     if (card.value === 'wild4') {
       const victim = state.players[nextPlayerIndex(1)];
-      const drawn = drawFromDeck(4);
-      victim.hand.push(...drawn);
-      showToast(`🔥 ${player.name} memainkan Wild +4 ke ${victim.name}! ${victim.name} mengambil 4 kartu.`);
-      advanceTurn(2);
+      showToast(`🔥 ${player.name} memainkan Wild +4 ke ${victim.name}!`);
+      
+      triggerTruthOrDare(victim, `Kena kartu Wild +4 dari ${player.name}! Selesaikan tantangan atau ambil 4 kartu!`, (completed) => {
+        if (!completed) {
+          const drawn = drawFromDeck(4);
+          victim.hand.push(...drawn);
+          showToast(`${victim.name} mengambil 4 kartu penalti!`);
+        } else {
+          showToast(`✨ ${victim.name} berhasil menyelesaikan tantangan!`);
+        }
+        advanceTurn(2);
+        checkPostPlay(player);
+      });
+      syncOnlineGameState();
+      return true;
     } else {
       advanceTurn(1);
     }
@@ -531,12 +537,22 @@ function playCard(playerIndex, cardId, chosenColor = null) {
         advanceTurn(1);
       }
     } else if (card.value === 'draw2') {
-      // Draw +2 — TIDAK ada Truth or Dare lagi, korban langsung dapat 2 kartu tambahan.
       const victim = state.players[nextPlayerIndex(1)];
-      const drawn = drawFromDeck(2);
-      victim.hand.push(...drawn);
-      showToast(`⚡ ${player.name} memainkan Draw +2 ke ${victim.name}! ${victim.name} mengambil 2 kartu.`);
-      advanceTurn(2);
+      showToast(`⚡ ${player.name} memainkan Draw +2 ke ${victim.name}!`);
+      
+      triggerTruthOrDare(victim, `Kena kartu Draw +2 dari ${player.name}! Jawab/Lakukan atau ambil 2 kartu!`, (completed) => {
+        if (!completed) {
+          const drawn = drawFromDeck(2);
+          victim.hand.push(...drawn);
+          showToast(`${victim.name} mengambil 2 kartu penalti!`);
+        } else {
+          showToast(`✨ ${victim.name} sukses menyelesaikan tantangan!`);
+        }
+        advanceTurn(2);
+        checkPostPlay(player);
+      });
+      syncOnlineGameState();
+      return true;
     }
   } else {
     state.currentColor = card.color;
@@ -614,18 +630,38 @@ function playMultipleCards(playerIndex, cardIds, chosenColor = null) {
     state.currentColor = chosenColor || 'red';
     const totalDraw = count * 4;
     const victim = state.players[nextPlayerIndex(1)];
-    const drawn = drawFromDeck(totalDraw);
-    victim.hand.push(...drawn);
-    showToast(`${victim.name} mengambil ${totalDraw} kartu dari Combo Wild +4!`);
-    advanceTurn(2);
+    
+    triggerTruthOrDare(victim, `Kena Combo Wild +${totalDraw} (${count}x Wild +4) dari ${player.name}! Selesaikan tantangan atau ambil ${totalDraw} kartu!`, (completed) => {
+      if (!completed) {
+        const drawn = drawFromDeck(totalDraw);
+        victim.hand.push(...drawn);
+        showToast(`${victim.name} mengambil ${totalDraw} kartu penalti!`);
+      } else {
+        showToast(`✨ ${victim.name} berhasil lolos dari ${totalDraw} kartu penalti!`);
+      }
+      advanceTurn(2);
+      checkPostPlay(player);
+    });
+    syncOnlineGameState();
+    return true;
   } else if (firstValue === 'draw2') {
     state.currentColor = lastCard.color;
     const totalDraw = count * 2;
     const victim = state.players[nextPlayerIndex(1)];
-    const drawn = drawFromDeck(totalDraw);
-    victim.hand.push(...drawn);
-    showToast(`${victim.name} mengambil ${totalDraw} kartu dari Combo Draw +2!`);
-    advanceTurn(2);
+
+    triggerTruthOrDare(victim, `Kena Combo Draw +${totalDraw} (${count}x +2) dari ${player.name}! Jawab/Lakukan atau ambil ${totalDraw} kartu!`, (completed) => {
+      if (!completed) {
+        const drawn = drawFromDeck(totalDraw);
+        victim.hand.push(...drawn);
+        showToast(`${victim.name} mengambil ${totalDraw} kartu penalti!`);
+      } else {
+        showToast(`✨ ${victim.name} sukses menyelesaikan tantangan!`);
+      }
+      advanceTurn(2);
+      checkPostPlay(player);
+    });
+    syncOnlineGameState();
+    return true;
   } else if (firstValue === 'skip') {
     state.currentColor = lastCard.color;
     showToast(`🚫 ${count} pemain dilewati sekaligus!`);
@@ -1104,18 +1140,17 @@ function renderPlayerHand() {
   container.innerHTML = '';
 
   // ─── Efek kartu bertumpuk (fanned hand) ───
-  // BUKAN giliranmu: kartu saling menutupi seperti kartu asli di
-  // tangan, cuma menyisakan sedikit bagian kiri (simbol pojok) yang
-  // kelihatan — hemat tempat, konsisten di semua ukuran layar.
-  // GILIRANMU: kartu otomatis dijabarkan normal (tidak menumpuk)
-  // supaya jelas kelihatan semua dan gampang dipilih.
+  // Kartu saling menutupi seperti kartu asli di tangan — cuma
+  // menyisakan sedikit bagian kiri (berisi simbol pojok) yang
+  // kelihatan. Overlap otomatis mengetat kalau kartunya banyak,
+  // supaya tetap muat tanpa perlu di-scroll ke samping.
   const n = displayPlayer.hand.length;
   const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 74;
   const containerWidth = container.clientWidth || (cardW * 6);
   const baseSliver = cardW * 0.42; // porsi kartu yang tetap kelihatan secara default
   let sliver = baseSliver;
 
-  if (!isMyTurn && n > 1) {
+  if (n > 1) {
     const neededWidthAtBase = cardW + baseSliver * (n - 1);
     if (neededWidthAtBase > containerWidth) {
       const minSliver = 22; // batas minimal, tetap cukup buat lihat simbol pojok
@@ -1132,9 +1167,7 @@ function renderPlayerHand() {
     el.dataset.cardId = card.id;
     el.style.animationDelay = (i * 0.03) + 's';
     el.classList.add('dealing');
-    if (!isMyTurn && i > 0) {
-      el.style.marginLeft = (sliver - cardW) + 'px';
-    }
+    if (i > 0) el.style.marginLeft = (sliver - cardW) + 'px';
     el.style.zIndex = i + 1;
 
     let sym = card.display || card.value;
@@ -1337,17 +1370,20 @@ function handleColorChoice(color) {
 }
 
 // ─── ACTION BUTTON HANDLERS ───────────────────────────────
-function handleDraw(forcedIdx) {
-  // forcedIdx dipakai saat fungsi ini dijalankan HOST atas nama pemain lain
-  // (hasil ACTION_DRAW dari HP tamu) — supaya tidak salah nebak "siapa aku"
-  // lewat getActiveClientIndex() yang selalu balikin index pemilik device ini.
-  // Jaga-jaga: kalau dipanggil langsung dari event listener (misal klik
-  // tombol), argumen pertamanya adalah objek Event, bukan angka — abaikan itu.
-  const hasForcedIdx = (typeof forcedIdx === 'number');
-  const myIdx = hasForcedIdx ? forcedIdx : getActiveClientIndex();
+// Proteksi anti-double-tap: mencegah 1 ketukan jari di layar sentuh
+// terhitung sebagai 2 aksi (misal ambil kartu 2x atau UNO terkirim 2x).
+let drawButtonLock = false;
+let unoButtonLock = false;
+
+function handleDraw() {
+  if (drawButtonLock) return;
+  drawButtonLock = true;
+  setTimeout(() => { drawButtonLock = false; }, 600);
+
+  const myIdx = getActiveClientIndex();
   if (state.currentPlayer !== myIdx || state.gameOver) return;
 
-  if (!hasForcedIdx && state.gameMode === 'online' && !mpState.isHost) {
+  if (state.gameMode === 'online' && !mpState.isHost) {
     sendActionToHost({ type: 'ACTION_DRAW' });
     return;
   }
@@ -1357,11 +1393,8 @@ function handleDraw(forcedIdx) {
   player.hand.push(...drawn);
   showToast(`${player.name} mengambil 1 kartu`);
 
-  // Reset mode combo cuma untuk device yang benar-benar menekan tombolnya sendiri
-  if (!hasForcedIdx) {
-    isComboMode = false;
-    selectedComboCards = [];
-  }
+  isComboMode = false;
+  selectedComboCards = [];
 
   const newPlayable = drawn.filter(isPlayable);
   renderAll();
@@ -1376,6 +1409,10 @@ function handleDraw(forcedIdx) {
 }
 
 function handleUnoButton() {
+  if (unoButtonLock) return;
+  unoButtonLock = true;
+  setTimeout(() => { unoButtonLock = false; }, 600);
+
   const myIdx = getActiveClientIndex();
   const player = state.players[myIdx];
 
@@ -1488,6 +1525,7 @@ function initHostRoom(maxPlayers = 2) {
     }
   }
 
+  startMultiplayerHeartbeat();
   showToast(`📱 Ruangan ${roomCode} siap untuk mabar!`, 'success');
 }
 
@@ -1505,6 +1543,149 @@ function attachPeerResilienceHandlers(peerObj) {
         if (peerObj && !peerObj.destroyed) peerObj.reconnect();
       } catch (e) {}
     }, 1000);
+  });
+}
+
+// ─── HEARTBEAT & WATCHDOG (DETEKSI KONEKSI MATI DI JARINGAN HP) ──
+// Kenapa ini perlu: event 'close' pada koneksi WebRTC TIDAK SELALU
+// terpicu saat HP pindah dari WiFi ke data seluler, layar dikunci
+// lama, atau sinyal hilang — koneksinya "menggantung" secara diam-diam
+// tanpa pernah bilang putus. Kalau kita cuma mengandalkan event 'close'
+// bawaan, pemain bisa dianggap tetap "tersambung" padahal sebenarnya
+// sudah mati, dan reconnect tidak pernah dipicu.
+// Solusinya: kedua sisi (host & guest) saling kirim 'PING' berkala,
+// dan sebuah watchdog mengecek — kalau sudah terlalu lama tidak ada
+// kabar sama sekali (PING/PONG/aksi apa pun) dari lawan bicara, koneksi
+// itu dianggap mati dan proses reconnect dipicu secara aktif.
+const HEARTBEAT_INTERVAL_MS = 4000;
+const WATCHDOG_INTERVAL_MS  = 3000;
+const CONN_WARN_AFTER_MS    = 7000;   // belum ada kabar > 7s → mulai kuning
+const CONN_DEAD_AFTER_MS    = 13000;  // belum ada kabar > 13s → dianggap putus
+
+function startMultiplayerHeartbeat() {
+  stopMultiplayerHeartbeat();
+  mpState.lastSeen = {};
+  mpState.hostLastSeen = Date.now();
+
+  mpState.heartbeatTimer = setInterval(() => {
+    if (!mpState.isOnline) return;
+    const ping = { type: 'PING', t: Date.now() };
+    if (mpState.isHost) {
+      mpState.connections.forEach(conn => {
+        if (conn.open) { try { conn.send(ping); } catch (e) {} }
+      });
+    } else if (mpState.hostConnection && mpState.hostConnection.open) {
+      try { mpState.hostConnection.send(ping); } catch (e) {}
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+
+  mpState.watchdogTimer = setInterval(() => {
+    if (!mpState.isOnline) return;
+    const now = Date.now();
+
+    if (mpState.isHost) {
+      // Cek tiap koneksi pemain satu per satu; kalau sudah lama tidak ada
+      // kabar sama sekali, anggap putus meskipun event 'close' tidak pernah
+      // terpicu, lalu proses seperti disconnect biasa supaya slotnya bisa
+      // diisi ulang saat pemain itu reconnect.
+      mpState.connections.slice().forEach(conn => {
+        const last = mpState.lastSeen[conn.peer] || now;
+        if (now - last > CONN_DEAD_AFTER_MS) {
+          console.warn('Watchdog: koneksi ke', conn.peer, 'dianggap mati (diam > 13d)');
+          try { conn.close(); } catch (e) {}
+          handlePeerDisconnected(conn);
+        }
+      });
+      const signalingOk = mpState.peer && !mpState.peer.disconnected && !mpState.peer.destroyed;
+      updateConnIndicator(signalingOk ? 'good' : 'warn');
+    } else {
+      const silence = now - mpState.hostLastSeen;
+      if (silence > CONN_DEAD_AFTER_MS) {
+        updateConnIndicator('bad');
+        // Jangan tumpuk banyak proses reconnect sekaligus
+        if (!mpState.reconnectRetryTimer) {
+          const hostPeerId = (PEER_PREFIX + mpState.roomCode.replace('UNO-', '')).toLowerCase();
+          try { if (mpState.hostConnection) mpState.hostConnection.close(); } catch (e) {}
+          handleHostConnectionLost(hostPeerId);
+        }
+      } else if (silence > CONN_WARN_AFTER_MS) {
+        updateConnIndicator('warn');
+      } else {
+        updateConnIndicator('good');
+      }
+    }
+  }, WATCHDOG_INTERVAL_MS);
+}
+
+function stopMultiplayerHeartbeat() {
+  clearInterval(mpState.heartbeatTimer);
+  clearInterval(mpState.watchdogTimer);
+  mpState.heartbeatTimer = null;
+  mpState.watchdogTimer = null;
+}
+
+// Titik kecil 🟢/🟡/🔴 di sebelah kode ruangan pada header.
+function updateConnIndicator(level) {
+  mpState.connIndicatorState = level;
+  const dot = document.getElementById('conn-indicator-dot');
+  if (!dot) return;
+  dot.classList.remove('conn-good', 'conn-warn', 'conn-bad');
+  dot.classList.add(level === 'good' ? 'conn-good' : (level === 'warn' ? 'conn-warn' : 'conn-bad'));
+  const labels = { good: 'Koneksi stabil', warn: 'Koneksi tidak stabil...', bad: 'Terputus, mencoba menyambung kembali...' };
+  dot.title = labels[level] || '';
+}
+
+// ─── SIKLUS HIDUP BROWSER MOBILE (BACKGROUND / KUNCI LAYAR / GANTI JARINGAN) ──
+// PENTING: 'visibilitychange' ke 'hidden' (app dipindah ke background,
+// layar dikunci) SENGAJA TIDAK dianggap sebagai disconnect — banyak game
+// yang salah menganggap ini sebagai keluar room, padahal koneksi WebRTC-nya
+// sendiri biasanya masih hidup di background untuk beberapa saat.
+// Kita hanya AKTIF memeriksa ulang koneksi saat halaman terlihat kembali
+// atau saat browser bilang internet baru saja kembali online.
+function handleReturnToForegroundOrOnline() {
+  if (!mpState.isOnline) return;
+
+  if (mpState.peer && mpState.peer.disconnected && !mpState.peer.destroyed) {
+    try { mpState.peer.reconnect(); } catch (e) {}
+  }
+
+  if (!mpState.isHost) {
+    const hostAlive = mpState.hostConnection && mpState.hostConnection.open;
+    if (!hostAlive) {
+      const hostPeerId = (PEER_PREFIX + mpState.roomCode.replace('UNO-', '')).toLowerCase();
+      handleHostConnectionLost(hostPeerId);
+    } else {
+      // Paksa kirim PING supaya status "terakhir dengar" langsung update,
+      // tidak perlu menunggu tick watchdog berikutnya.
+      try { mpState.hostConnection.send({ type: 'PING', t: Date.now() }); } catch (e) {}
+    }
+  }
+}
+
+function setupMobileLifecycleHandlers() {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      handleReturnToForegroundOrOnline();
+    }
+    // 'hidden' sengaja tidak diapa-apakan — lihat catatan di atas.
+  });
+
+  window.addEventListener('pageshow', (e) => {
+    // e.persisted = true berarti halaman dipulihkan dari bfcache
+    // (misalnya user menekan tombol back di Chrome Android)
+    if (e.persisted) handleReturnToForegroundOrOnline();
+  });
+
+  window.addEventListener('online', () => {
+    showToast('🌐 Internet tersambung kembali, memeriksa koneksi game...', 'info');
+    handleReturnToForegroundOrOnline();
+  });
+
+  window.addEventListener('offline', () => {
+    if (mpState.isOnline) {
+      showToast('📵 Internet di perangkat ini terputus.', 'warning');
+      updateConnIndicator('bad');
+    }
   });
 }
 
@@ -1561,6 +1742,8 @@ function restoreHostRoom(roomCode, saved) {
     }
   }
 
+  startMultiplayerHeartbeat();
+
   if (mpState.gameStarted) {
     document.getElementById('start-screen').style.display = 'none';
     document.getElementById('online-lobby-modal').classList.remove('open');
@@ -1603,23 +1786,36 @@ function attemptSessionReconnect() {
 }
 
 function handleIncomingPeerConnection(conn) {
-  if (mpState.lobbyPlayers.length >= mpState.maxPlayers) {
-    const reject = () => {
-      try { conn.send({ type: 'ROOM_FULL', message: 'Ruangan sudah penuh!' }); } catch (e) {}
-      setTimeout(() => conn.close(), 500);
-    };
-    if (conn.open) reject();
-    else conn.on('open', reject);
-    return;
-  }
-
+  // CATATAN PERBAIKAN BUG: dulu di sini koneksi langsung ditolak dengan
+  // ROOM_FULL kalau jumlah lobbyPlayers sudah >= maxPlayers. Itu terlihat
+  // benar untuk lobi, TAPI begitu game sudah dimulai, lobbyPlayers SELALU
+  // penuh (semua slot sudah terisi pemain yang sedang main) — jadi setiap
+  // kali ada pemain yang disconnect lalu HP-nya mencoba menyambung lagi,
+  // koneksi barunya langsung ditolak di sini sebelum sempat dicek apakah
+  // dia pemain lama yang reconnect. Akibatnya: pemain yang terputus di
+  // tengah game jadi TIDAK BISA connect lagi sama sekali.
+  // Perbaikan: selalu terima koneksinya dulu, baru keputusan "penuh atau
+  // tidak" diambil di processIncomingHostAction() setelah kita tahu apakah
+  // ini reconnect (clientId sudah dikenal) atau benar-benar pemain baru.
   const registerConn = () => {
-    // PENTING: ganti (bukan skip) koneksi lama dengan peer ID yang sama.
-    // Kalau cuma di-skip, koneksi baru yang sehat (misal setelah reconnect)
-    // tidak akan pernah dipakai untuk broadcast — host jadi cuma bisa TERIMA
-    // pesan dari device itu, tapi tidak bisa MENGIRIM balik ke sana lagi.
-    mpState.connections = mpState.connections.filter(c => c.peer !== conn.peer);
+    // PERBAIKAN BUG: dulu koneksi baru yang sehat dari peer yang SAMA
+    // (misalnya pemain reconnect pakai peer id lama) tidak akan pernah
+    // terdaftar kalau ternyata masih ada koneksi lama dengan peer id yang
+    // sama tersisa di array — meskipun koneksi lama itu sebenarnya sudah
+    // "zombie" (mati tapi event 'close'-nya tidak pernah terpicu). Akibatnya
+    // pemain yang reconnect terlihat tersambung di layarnya sendiri, tapi
+    // host diam-diam tidak pernah mengirim data apa pun ke dia.
+    // Sekarang: koneksi lama dengan peer id yang sama SELALU ditutup &
+    // digantikan oleh koneksi baru ini.
+    mpState.connections = mpState.connections.filter(c => {
+      if (c.peer === conn.peer && c !== conn) {
+        try { c.close(); } catch (e) {}
+        return false;
+      }
+      return true;
+    });
     mpState.connections.push(conn);
+    mpState.lastSeen[conn.peer] = Date.now();
     // Kirim lobby state langsung saat koneksi tersambung
     mpBroadcastLobbyState();
   };
@@ -1651,6 +1847,22 @@ function handleHostChannelMessage(data) {
 
 function processIncomingHostAction(senderId, data) {
   if (!data) return;
+
+  // Kabar apa pun dari pemain ini (bukan cuma PING) membuktikan koneksinya
+  // masih hidup — dipakai watchdog untuk mendeteksi koneksi yang diam-diam
+  // mati tanpa pernah memicu event 'close'.
+  if (senderId) mpState.lastSeen[senderId] = Date.now();
+
+  if (data.type === 'PING') {
+    const conn = mpState.connections.find(c => c.peer === senderId);
+    if (conn && conn.open) {
+      try { conn.send({ type: 'PONG', t: data.t }); } catch (e) {}
+    }
+    return;
+  }
+  if (data.type === 'PONG') {
+    return;
+  }
 
   if (data.type === 'JOIN_REQUEST') {
     // ── Reconnect ke GAME yang SUDAH berjalan (bukan lagi di lobi) ──
@@ -1687,6 +1899,13 @@ function processIncomingHostAction(senderId, data) {
       };
       mpState.lobbyPlayers.push(newPlayer);
       addLobbyChatMessage('system', `👋 ${newPlayer.name} bergabung ke lobi!`);
+    } else {
+      // Ruangan benar-benar penuh DAN ini bukan pemain lama yang reconnect
+      // (baru ditolak di sini, bukan sebelum sempat dicek clientId-nya)
+      const conn = mpState.connections.find(c => c.peer === senderId);
+      try { if (conn) conn.send({ type: 'ROOM_FULL', message: 'Ruangan sudah penuh!' }); } catch (e) {}
+      if (conn) setTimeout(() => conn.close(), 500);
+      return;
     }
 
     // Selalu kirim balik LOBBY_UPDATE agar guest langsung tersinkron
@@ -1704,7 +1923,7 @@ function processIncomingHostAction(senderId, data) {
   } else if (data.type === 'ACTION_DRAW') {
     const pIdx = mpState.lobbyPlayers.findIndex(p => p.peerId === senderId || p.clientId === senderId);
     if (pIdx === state.currentPlayer) {
-      handleDraw(pIdx);
+      handleDraw();
     }
   } else if (data.type === 'ACTION_CALL_UNO') {
     const pIdx = mpState.lobbyPlayers.findIndex(p => p.peerId === senderId || p.clientId === senderId);
@@ -1723,8 +1942,7 @@ function processIncomingHostAction(senderId, data) {
     const p = mpState.lobbyPlayers.find(pl => pl.peerId === senderId || pl.clientId === senderId);
     const sender = p ? p.name : 'Tamu';
     addLobbyChatMessage('user', data.text, sender);
-    // Kecualikan pengirim asli supaya pesannya tidak dobel di layarnya sendiri
-    mpBroadcast({ type: 'CHAT_MSG', sender: sender, text: data.text }, senderId);
+    mpBroadcast({ type: 'CHAT_MSG', sender: sender, text: data.text });
   } else if (data.type === 'ACTION_REACTION') {
     triggerLiveReaction(data.emoji, true);
     mpBroadcast({ type: 'LIVE_REACTION', emoji: data.emoji });
@@ -1757,9 +1975,9 @@ function handlePeerDisconnected(conn) {
   }
 }
 
-function mpBroadcast(payload, excludePeerId = null) {
+function mpBroadcast(payload) {
   mpState.connections.forEach(conn => {
-    if (conn.open && conn.peer !== excludePeerId) {
+    if (conn.open) {
       try { conn.send(payload); } catch (e) {}
     }
   });
@@ -1852,9 +2070,7 @@ function joinOnlineRoom(roomCodeInput) {
     });
   } catch (e) {}
 
-  // 2. Koneksi WebRTC PeerJS — dengan retry otomatis kalau percobaan
-  // pertama gagal (misal Host belum sempat terdaftar di server saat
-  // kode baru saja dibagikan, atau jaringan lambat sesaat).
+  // 2. Koneksi WebRTC PeerJS
   if (typeof Peer !== 'undefined') {
     try {
       if (mpState.peer) mpState.peer.destroy();
@@ -1863,7 +2079,42 @@ function joinOnlineRoom(roomCodeInput) {
 
       mpState.peer.on('open', (myId) => {
         mpState.myPeerId = myId;
-        attemptConnectToHost(hostPeerId, 1);
+        const conn = mpState.peer.connect(hostPeerId, { reliable: true });
+        mpState.hostConnection = conn;
+
+        const sendJoin = () => {
+          try {
+            conn.send({
+              type: 'JOIN_REQUEST',
+              clientId: mpState.localClientId,
+              name: localPlayerName,
+              avatar: localPlayerAvatar
+            });
+            document.getElementById('lobby-connection-status').innerHTML =
+              `<span class="status-dot online"></span> ✅ Terhubung ke Lobi Host!`;
+          } catch (e) {}
+        };
+
+        conn.on('data', (data) => {
+          handleClientReceivedData(data);
+        });
+
+        conn.on('close', () => {
+          handleHostConnectionLost(hostPeerId);
+        });
+
+        if (conn.open) {
+          sendJoin();
+        } else {
+          conn.on('open', sendJoin);
+        }
+
+        // Retry handshake periodically in case of mobile network packet delays
+        mpState.joinRetryTimer = setInterval(() => {
+          if (conn.open) {
+            sendJoin();
+          }
+        }, 1500);
       });
 
       mpState.peer.on('error', (err) => {
@@ -1874,78 +2125,8 @@ function joinOnlineRoom(roomCodeInput) {
     }
   }
 
+  startMultiplayerHeartbeat();
   showToast(`🌐 Menghubungkan ke Ruangan ${roomCode}...`, 'info');
-}
-
-// ─── COBA CONNECT KE HOST DENGAN RETRY OTOMATIS ───────────
-// PeerJS kadang butuh beberapa detik untuk benar-benar siap di sisi
-// Host, atau paket pertama bisa hilang di jaringan mobile. Fungsi ini
-// mencoba beberapa kali dengan jeda, dan kasih pesan jelas ke user
-// kalau semua percobaan gagal — daripada nyangkut diam-diam selamanya.
-function attemptConnectToHost(hostPeerId, attempt) {
-  if (!mpState.isOnline || mpState.isHost) return; // sudah keluar/berubah peran, batalkan
-
-  const maxAttempts = 6;
-  const statusEl = document.getElementById('lobby-connection-status');
-  if (statusEl) {
-    statusEl.innerHTML = `<span class="status-dot online"></span> Menghubungkan ke HP Host... (percobaan ${attempt}/${maxAttempts})`;
-  }
-
-  let settled = false;
-  const conn = mpState.peer.connect(hostPeerId, { reliable: true });
-  mpState.hostConnection = conn;
-
-  const giveUpTimer = setTimeout(() => {
-    if (settled) return;
-    settled = true;
-    try { conn.close(); } catch (e) {}
-
-    if (attempt < maxAttempts) {
-      setTimeout(() => attemptConnectToHost(hostPeerId, attempt + 1), 1000);
-    } else {
-      if (statusEl) {
-        statusEl.innerHTML = `<span class="status-dot offline"></span> ❌ Gagal menghubungkan ke Host.`;
-      }
-      showToast('❌ Gagal menyambung ke Ruangan. Pastikan kode benar & Host masih membuka lobi, lalu coba lagi.', 'error');
-    }
-  }, 5000);
-
-  const sendJoin = () => {
-    try {
-      conn.send({
-        type: 'JOIN_REQUEST',
-        clientId: mpState.localClientId,
-        name: localPlayerName,
-        avatar: localPlayerAvatar
-      });
-      if (statusEl) {
-        statusEl.innerHTML = `<span class="status-dot online"></span> ✅ Terhubung ke Lobi Host!`;
-      }
-    } catch (e) {}
-  };
-
-  conn.on('open', () => {
-    settled = true;
-    clearTimeout(giveUpTimer);
-    sendJoin();
-
-    clearInterval(mpState.joinRetryTimer);
-    mpState.joinRetryTimer = setInterval(() => {
-      if (conn.open) sendJoin();
-    }, 1500);
-  });
-
-  conn.on('data', (data) => {
-    handleClientReceivedData(data);
-  });
-
-  conn.on('close', () => {
-    handleHostConnectionLost(hostPeerId);
-  });
-
-  conn.on('error', (err) => {
-    console.warn('Connection error saat join:', err);
-  });
 }
 
 // ─── AUTO-RECONNECT KE HOST SAAT KONEKSI TIBA-TIBA PUTUS ──
@@ -2006,6 +2187,19 @@ function handleHostConnectionLost(hostPeerId) {
 function handleClientReceivedData(data) {
   if (!data || data.senderClientId === mpState.localClientId) return;
 
+  // Kabar apa pun dari host (bukan cuma PING) membuktikan koneksinya masih
+  // hidup — dipakai watchdog untuk mendeteksi koneksi yang diam-diam mati.
+  mpState.hostLastSeen = Date.now();
+
+  if (data.type === 'PING') {
+    if (mpState.hostConnection && mpState.hostConnection.open) {
+      try { mpState.hostConnection.send({ type: 'PONG', t: data.t }); } catch (e) {}
+    }
+    return;
+  }
+  if (data.type === 'PONG') {
+    return;
+  }
 
   if (data.type === 'LOBBY_UPDATE') {
     clearInterval(mpState.joinRetryTimer);
@@ -2063,11 +2257,33 @@ function handleClientReceivedData(data) {
     document.getElementById('header-mode-tag').textContent = 'Mabar Beda HP';
 
     renderAll();
-    showToast('🔌 Berhasil tersambung kembali ke permainan!', 'success');
+    // PERBAIKAN BUG: dulu kalau ternyata permainan sudah selesai SAAT kita
+    // reconnect (host sudah declare pemenang sementara kita terputus),
+    // layar pemenang tidak pernah muncul di HP ini — pemain jadi tersangkut
+    // melihat papan permainan biasa yang semua tombolnya nonaktif.
+    const winnerOnReconnect = state.players.find(p => p.hand.length === 0);
+    if (state.gameOver && winnerOnReconnect) {
+      showWinner(winnerOnReconnect);
+    } else {
+      showToast('🔌 Berhasil tersambung kembali ke permainan!', 'success');
+    }
   } else if (data.type === 'STATE_SYNC') {
     state = data.state;
     state.gameMode = 'online';
-    renderAll();
+    // PERBAIKAN BUG UTAMA: sebelumnya saat permainan berakhir, host memanggil
+    // showWinner() hanya di layarnya sendiri lalu mem-broadcast STATE_SYNC
+    // biasa. Di HP pemain lain, STATE_SYNC hanya me-render ulang papan
+    // permainan (yang tombol-tombolnya sudah nonaktif karena gameOver true)
+    // tanpa pernah menampilkan layar pemenang — jadi HP itu terlihat
+    // "nyangkut"/stuck di dalam room walau game sudah selesai. Sekarang kita
+    // cek: kalau gameOver true dan ada pemenangnya, tampilkan layar
+    // pemenang juga di HP ini.
+    const winner = state.players.find(p => p.hand.length === 0);
+    if (state.gameOver && winner) {
+      showWinner(winner);
+    } else {
+      renderAll();
+    }
   } else if (data.type === 'SYNC_TOD') {
     customTruths = data.truths;
     customDares  = data.dares;
@@ -2092,6 +2308,10 @@ function handleClientReceivedData(data) {
     document.getElementById('winner-screen').classList.remove('open');
     document.getElementById('online-room-badge').style.display = 'none';
     document.getElementById('start-screen').style.display = 'flex';
+  } else if (data.type === 'ROOM_FULL') {
+    clearInterval(mpState.joinRetryTimer);
+    clearInterval(mpState.reconnectRetryTimer);
+    showToast('❌ ' + (data.message || 'Ruangan sudah penuh!'), 'error');
   } else if (data.type === 'HOST_LEFT') {
     showToast('🚪 Host telah meninggalkan permainan. Kamu akan kembali ke menu.', 'warning');
     clearInterval(mpState.reconnectRetryTimer);
@@ -2170,6 +2390,7 @@ function openOnlineLobby(roomCode) {
 function closeOnlineLobby() {
   clearInterval(mpState.joinRetryTimer);
   clearInterval(mpState.reconnectRetryTimer);
+  stopMultiplayerHeartbeat();
 
   // Ini adalah "keluar untuk selamanya" dari ruangan ini, jadi sesi
   // yang tersimpan (untuk auto-reconnect) dihapus supaya tidak
@@ -2779,6 +3000,7 @@ document.addEventListener('DOMContentLoaded', () => {
   createStars();
   loadCustomData();
   setupStartScreen();
+  setupMobileLifecycleHandlers();
   updateTodSummaryBadge();
 
   // Editor Modal Events
