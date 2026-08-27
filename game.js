@@ -1140,21 +1140,30 @@ function renderPlayerHand() {
   container.innerHTML = '';
 
   // ─── Efek kartu bertumpuk (fanned hand) ───
-  // Kartu saling menutupi seperti kartu asli di tangan — cuma
-  // menyisakan sedikit bagian kiri (berisi simbol pojok) yang
-  // kelihatan. Overlap otomatis mengetat kalau kartunya banyak,
-  // supaya tetap muat tanpa perlu di-scroll ke samping.
+  // Saat BUKAN giliran pemain: kartu ditumpuk rapat, cuma menyisakan
+  // sedikit bagian kiri (sekitar separuh) supaya hemat tempat selagi
+  // menunggu — kartu memang tidak bisa dipilih saat itu.
+  // Saat GILIRAN pemain: kartu dilebarkan penuh (tidak tumpang tindih)
+  // supaya jelas terbaca & mudah dipilih. Kalau tidak muat di lebar
+  // layar, biarkan wrap ke baris berikutnya (desktop) atau digeser ke
+  // samping (HP, lihat #hand-container di style.css) — bukan dipaksa
+  // menumpuk lagi.
   const n = displayPlayer.hand.length;
   const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 74;
   const containerWidth = container.clientWidth || (cardW * 6);
-  const baseSliver = cardW * 0.42; // porsi kartu yang tetap kelihatan secara default
-  let sliver = baseSliver;
 
-  if (n > 1) {
-    const neededWidthAtBase = cardW + baseSliver * (n - 1);
-    if (neededWidthAtBase > containerWidth) {
-      const minSliver = 22; // batas minimal, tetap cukup buat lihat simbol pojok
-      sliver = Math.max(minSliver, (containerWidth - cardW) / (n - 1));
+  let sliver;
+  if (isMyTurn) {
+    sliver = cardW;
+  } else {
+    const baseSliver = cardW * 0.42; // porsi kartu yang tetap kelihatan secara default
+    sliver = baseSliver;
+    if (n > 1) {
+      const neededWidthAtBase = cardW + baseSliver * (n - 1);
+      if (neededWidthAtBase > containerWidth) {
+        const minSliver = 22; // batas minimal, tetap cukup buat lihat simbol pojok
+        sliver = Math.max(minSliver, (containerWidth - cardW) / (n - 1));
+      }
     }
   }
 
